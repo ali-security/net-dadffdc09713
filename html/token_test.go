@@ -626,6 +626,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -933,3 +943,66 @@ func benchmarkTokenizer(b *testing.B, level int) {
 func BenchmarkRawLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, rawLevel) }
 func BenchmarkLowLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, lowLevel) }
 func BenchmarkHighLevelTokenizer(b *testing.B) { benchmarkTokenizer(b, highLevel) }
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+func TestDuplicateAttributesParseRender(t *testing.T) {
+	// A duplicate attribute name is dropped, so that code which inspects or
+	// rewrites the parsed attributes (such as a sanitizer) sees exactly what a
+	// browser re-parsing the rendered markup would see: the first occurrence.
+	const src = `<a href="/safe" HREF="javascript:alert(1)" onclick="x" ONCLICK="evil()">t</a>`
+
+	z := NewTokenizer(strings.NewReader(src))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	// The raw bytes must still be the original, unmodified input.
+	if got, want := string(z.Raw()), `<a href="/safe" HREF="javascript:alert(1)" onclick="x" ONCLICK="evil()">`; got != want {
+		t.Errorf("Raw() = %q, want %q", got, want)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d: %v", len(tok.Attr), tok.Attr)
+	}
+	if tok.Attr[0].Key != "href" || tok.Attr[0].Val != "/safe" {
+		t.Errorf("attribute 0 = %q=%q, want href=/safe", tok.Attr[0].Key, tok.Attr[0].Val)
+	}
+	if tok.Attr[1].Key != "onclick" || tok.Attr[1].Val != "x" {
+		t.Errorf("attribute 1 = %q=%q, want onclick=x", tok.Attr[1].Key, tok.Attr[1].Val)
+	}
+
+	doc, err := Parse(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	b := &bytes.Buffer{}
+	if err := Render(b, doc); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	got := b.String()
+	if strings.Contains(got, "javascript:alert(1)") || strings.Contains(got, "evil()") {
+		t.Errorf("duplicate attribute survived the parse/render round trip: %s", got)
+	}
+	if want := `<a href="/safe" onclick="x">t</a>`; !strings.Contains(got, want) {
+		t.Errorf("Render = %s, want it to contain %s", got, want)
+	}
+}
