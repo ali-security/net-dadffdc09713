@@ -1,0 +1,73 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run; empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          check-latest: true
+
+      # Pack the module zip FIRST, from a pristine copy of the tree, before any
+      # build byproduct can land in the working directory. .github/ is staged
+      # out because the public module zip for v0.45.0 ships no .github member:
+      # this workflow is Seal's own build plumbing, not upstream content.
+      - name: Stage module source
+        run: |
+          set -euxo pipefail
+          rm -rf "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/out"
+          mkdir -p "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/out"
+          rsync -a --exclude='.git' --exclude='.github' ./ "$RUNNER_TEMP/modsrc/"
+
+      - name: Create module zip
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/zipper"
+          cp .github/seal/create_mod.go "$RUNNER_TEMP/zipper/create_mod.go"
+          cd "$RUNNER_TEMP/zipper"
+          go mod init example.com/zipper
+          go get golang.org/x/mod@v0.28.0
+          go run . golang.org/x/net v0.45.0 "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/out/v0.45.0.zip"
+          unzip -Z1 "$RUNNER_TEMP/out/v0.45.0.zip" | wc -l
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.45.0.zip
+          if-no-files-found: error
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -o pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || exit 1
+            done
+          else
+            go test ./...
+          fi
